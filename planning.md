@@ -1,149 +1,234 @@
 # FitFindr — planning.md
 
-> Complete this document before writing any implementation code.
-> Your spec and agent diagram are what you'll use to direct AI tools (Claude, Copilot, etc.) to generate your implementation — the more specific they are, the more useful the generated code will be.
-> Your planning.md will be reviewed as part of your submission.
-> Update it before starting any stretch features.
+> Spec written before implementation. Updated to reflect the final agent design.
 
 ---
 
 ## Tools
 
-List every tool your agent will use. For each tool, fill in all four fields.
-You must have at least 3 tools. The three required tools are listed — add any additional tools below them.
-
 ### Tool 1: search_listings
 
 **What it does:**
-<!-- Describe what this tool does in 1–2 sentences -->
+Searches the 40 mock secondhand listings in `data/listings.json` and returns items whose title, description, category, and style tags match the user's keywords. Results can be filtered by size and max price, then ranked by relevance score.
 
 **Input parameters:**
-<!-- List each parameter, its type, and what it represents -->
-- `description` (str): ...
-- `size` (str): ...
-- `max_price` (float): ...
+- `description` (str): Keywords describing what the user wants (e.g., `"vintage graphic tee"`). Parsed from the natural language query by regex in `utils/query_parsers.py`.
+- `size` (str | None): Optional size filter. Case-insensitive substring match (e.g., `"M"` matches `"S/M"`). `None` skips size filtering.
+- `max_price` (float | None): Optional maximum price (inclusive). Listings above this price are excluded. `None` skips price filtering.
 
 **What it returns:**
-<!-- Describe the return value — what fields does a result contain? -->
+A `list[dict]` of matching listing objects, sorted best-match first. Each dict contains:
+`id`, `title`, `description`, `category`, `style_tags` (list[str]), `size`, `condition`, `price` (float), `colors` (list[str]), `brand` (str | null), `platform` (str).
+
+Returns an empty list `[]` when nothing matches. Does not raise an exception.
 
 **What happens if it fails or returns nothing:**
-<!-- What should the agent do if no listings match? -->
+The agent sets `session["error"]` to a specific message naming the search terms and active filters (size, price), then **returns early**. It does **not** call `suggest_outfit` or `create_fit_card`. Example: *"No listings matched your search for 'designer ballgown'. Active filters: size XXS, under $5. Try broadening your search — use fewer filters, raise your price limit, or try different keywords."*
 
 ---
 
 ### Tool 2: suggest_outfit
 
 **What it does:**
-<!-- Describe what this tool does in 1–2 sentences -->
+Given the top thrift find and the user's wardrobe, calls Groq (`llama-3.3-70b-versatile`) to suggest 1–2 complete outfit combinations. If the wardrobe is empty, it returns general styling advice instead of naming specific wardrobe pieces.
 
 **Input parameters:**
-<!-- List each parameter, its type, and what it represents -->
-- `new_item` (dict): ...
-- `wardrobe` (dict): ...
+- `new_item` (dict): A listing dict from `search_listings` — the agent passes `session["selected_item"]` (the top search result).
+- `wardrobe` (dict): User wardrobe with an `items` key containing a list of wardrobe item dicts (`id`, `name`, `category`, `colors`, `style_tags`, optional `notes`).
 
 **What it returns:**
-<!-- Describe the return value -->
+A non-empty `str` with outfit suggestions or general styling advice. Never raises for an empty wardrobe.
 
 **What happens if it fails or returns nothing:**
-<!-- What should the agent do if the wardrobe is empty or no outfit can be suggested? -->
+- **Empty wardrobe:** Tool still runs and returns general pairing advice (not an error).
+- **Missing API key / invalid key:** Tool raises `ValueError`; agent sets `session["error"]` telling the user to fix `GROQ_API_KEY` and returns early with no fit card.
+- **Empty LLM response:** Tool returns a fallback string asking the user to try again.
 
 ---
 
 ### Tool 3: create_fit_card
 
 **What it does:**
-<!-- Describe what this tool does in 1–2 sentences -->
+Takes the outfit suggestion string and the selected listing, then calls Groq (`llama-3.3-70b-versatile`, temperature 0.95) to write a 2–4 sentence Instagram/TikTok-style caption mentioning the item title, price, and platform naturally.
 
 **Input parameters:**
-<!-- List each parameter, its type, and what it represents -->
-- `outfit` (...): ...
+- `outfit` (str): The outfit suggestion string from `suggest_outfit` — passed as `session["outfit_suggestion"]`.
+- `new_item` (dict): The same listing dict passed to `suggest_outfit` — `session["selected_item"]`.
 
 **What it returns:**
-<!-- Describe the return value -->
+A `str` caption suitable for sharing. If `outfit` is empty or whitespace-only, returns an error message string instead of calling the LLM.
 
 **What happens if it fails or returns nothing:**
-<!-- What should the agent do if the outfit data is incomplete? -->
+- **Empty outfit input:** Returns *"Can't create a fit card without an outfit suggestion. Style the find first, then try generating the fit card again."* — no exception.
+- **API failure:** Agent catches the error, sets `session["error"]`, and returns. The outfit suggestion may still be available in the session.
 
 ---
 
 ### Additional Tools (if any)
 
-<!-- Copy the block above for any tools beyond the required three -->
+None implemented. Stretch feature candidate: retry search with loosened filters when no results are found.
 
 ---
 
 ## Planning Loop
 
 **How does your agent decide which tool to call next?**
-<!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
+
+`run_agent()` in `agent.py` uses a **conditional sequential loop** — not a fixed pipeline. Each step checks session state before proceeding:
+
+1. **Parse query** → store in `session["parsed"]`. If `item_type` is empty after parsing, set error and **stop** (no tools called).
+2. **Call `search_listings`** with parsed `item_type`, `size`, `max_price`. Store all results in `session["search_results"]`.
+3. **Branch on search results:**
+   - If `search_results` is empty → set `session["error"]` with filter details and **return immediately**. `suggest_outfit` and `create_fit_card` are **not** called.
+   - If results exist → set `session["selected_item"] = search_results[0]` and continue.
+4. **Call `suggest_outfit(selected_item, wardrobe)`** → store in `session["outfit_suggestion"]`. On API failure, set error and **stop** (no fit card).
+5. **Call `create_fit_card(outfit_suggestion, selected_item)`** → store in `session["fit_card"]`.
+6. **Return session.**
+
+The agent is done when either an error is set (early exit) or all three tools have run successfully.
+
+**Key conditional:** Step 3 is the branch that makes behavior adaptive — a no-results query never reaches outfit or fit-card tools.
 
 ---
 
 ## State Management
 
 **How does information from one tool get passed to the next?**
-<!-- Describe how your agent stores and accesses state within a session. What data is tracked? How is it passed between tool calls? -->
+
+All state lives in a single **session dict** created by `_new_session()` at the start of each interaction:
+
+| Field | Set when | Used by |
+|-------|----------|---------|
+| `query` | Session start | Reference / debugging |
+| `parsed` | After `parse_query()` | Drives `search_listings` inputs |
+| `search_results` | After search | Source for item selection |
+| `selected_item` | After search (if results) | Passed to `suggest_outfit` and `create_fit_card` |
+| `wardrobe` | Session start | Passed to `suggest_outfit` |
+| `outfit_suggestion` | After `suggest_outfit` | Passed to `create_fit_card` |
+| `fit_card` | After `create_fit_card` | Final user output |
+| `error` | On any early exit | Shown in UI; blocks further tools |
+
+The user never re-enters data between steps. The exact same `selected_item` dict object flows from search → outfit → fit card within one session.
 
 ---
 
 ## Error Handling
 
-For each tool, describe the specific failure mode you're handling and what the agent does in response.
-
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | |
-| suggest_outfit | Wardrobe is empty | |
-| create_fit_card | Outfit input is missing or incomplete | |
+| search_listings | No results match the query | Sets `session["error"]` with search terms + active filters + suggestions to broaden search. Returns session with `selected_item`, `outfit_suggestion`, and `fit_card` all `None`. Does not call downstream tools. |
+| suggest_outfit | Wardrobe is empty | **Not a failure** — tool returns general styling advice. Agent continues to `create_fit_card`. |
+| suggest_outfit | Missing/invalid Groq API key | Sets `session["error"]`: *"Outfit styling failed: Invalid GROQ_API_KEY…"* Returns early; fit card not generated. |
+| create_fit_card | Outfit input is missing or incomplete | Tool returns error string internally if outfit is empty. Agent only reaches this tool when outfit exists; API failures set `session["error"]` but outfit text remains in session. |
 
 ---
 
 ## Architecture
 
-<!-- Draw a diagram of your agent showing how the components connect:
-     User input → Planning Loop → Tools (search_listings, suggest_outfit, create_fit_card)
-                                                                          ↕
-                                                                   State / Session
-     Show what triggers each tool, how state flows between them, and where error paths branch off.
-     ASCII art, a Mermaid diagram (https://mermaid.js.org/syntax/flowchart.html), or an embedded
-     sketch are all fine. You'll share this diagram with an AI tool when asking it to implement
-     the planning loop and each individual tool. -->
+```
+User query + wardrobe choice (Gradio app.py)
+    │
+    ▼
+run_agent(query, wardrobe)  ── agent.py
+    │
+    ├─ parse_query() → session["parsed"]
+    │       │
+    │       └─ item_type empty? ──► session["error"] → RETURN
+    │
+    ├─ search_listings(description, size, max_price)  ── tools.py
+    │       │
+    │       ├─ results = [] ──► session["error"] = helpful message → RETURN
+    │       │                     (suggest_outfit & create_fit_card NOT called)
+    │       │
+    │       └─ results = [item, ...]
+    │               │
+    │           session["selected_item"] = results[0]
+    │               │
+    ├─ suggest_outfit(selected_item, wardrobe)  ── tools.py → Groq LLM
+    │       │
+    │       ├─ API error ──► session["error"] → RETURN
+    │       │
+    │   session["outfit_suggestion"] = "..."
+    │               │
+    └─ create_fit_card(outfit_suggestion, selected_item)  ── tools.py → Groq LLM
+            │
+            ├─ API error ──► session["error"] → RETURN
+            │
+        session["fit_card"] = "..."
+            │
+            ▼
+        Return session → app.py maps to 3 UI panels
+```
+
+```mermaid
+flowchart TD
+    A[User Query] --> B[parse_query]
+    B --> C{item_type empty?}
+    C -->|yes| E1[session error → return]
+    C -->|no| D[search_listings]
+    D --> F{results empty?}
+    F -->|yes| E2[session error → return]
+    F -->|no| G[selected_item = results 0]
+    G --> H[suggest_outfit]
+    H --> I{API ok?}
+    I -->|no| E3[session error → return]
+    I -->|yes| J[create_fit_card]
+    J --> K{API ok?}
+    K -->|no| E4[session error → return]
+    K -->|yes| L[Return session with fit_card]
+```
 
 ---
 
 ## AI Tool Plan
 
-<!-- For each part of the implementation below, describe:
-     - Which AI tool you plan to use (Claude, Copilot, ChatGPT, etc.)
-     - What you'll give it as input (which sections of this planning.md, your agent diagram)
-     - What you expect it to produce
-     - How you'll verify the output matches your spec before moving on
-
-     "I'll use AI to help me code" is not a plan.
-     "I'll give Claude my Tool 1 spec (inputs, return value, failure mode) and ask it to implement
-     search_listings() using load_listings() from the data loader — then test it against 3 queries
-     before trusting it" is a plan. -->
-
 **Milestone 3 — Individual tool implementations:**
 
+| Tool | AI input given | Expected output | Verification |
+|------|---------------|-----------------|--------------|
+| `search_listings` | Tool 1 block above + `load_listings()` signature | Keyword scoring function with price/size filters | Ran `pytest tests/test_tools.py` — 3 search tests pass including empty results and price filter |
+| `suggest_outfit` | Tool 2 block + listing/wardrobe field names | Groq LLM call with empty-wardrobe branch | Mocked Groq in test; manually verified empty wardrobe returns string not exception |
+| `create_fit_card` | Tool 3 block + caption style guidelines | LLM caption with temperature 0.95 + empty-outfit guard | `test_create_fit_card_empty_outfit` confirms error string, no crash |
+
 **Milestone 4 — Planning loop and state management:**
+
+| Task | AI input given | Expected output | Verification |
+|------|---------------|-----------------|--------------|
+| Query parsers | Example queries from project brief | Regex extractors for price, size, item description | Tested with `"vintage graphic tee under 30, size M"` |
+| `run_agent` | Architecture diagram + Planning Loop + State Management sections | Conditional loop with early return on empty search | `test_agent_no_results_path` confirms fit_card stays None; `agent.py` CLI shows different behavior for happy vs no-results paths |
 
 ---
 
 ## A Complete Interaction (Step by Step)
 
-Write out what a full user interaction looks like from start to finish — tool call by tool call. Use a specific example query.
-
 **Example user query:** "I'm looking for a vintage graphic tee under $30. I mostly wear baggy jeans and chunky sneakers. What's out there and how would I style it?"
 
-**Step 1:**
-<!-- What does the agent do first? Which tool is called? With what input? -->
+**Step 1 — Parse query**
+- `parse_query()` extracts: `item_type="vintage graphic tee"`, `max_price=30.0`, `size=None`, `style_tags=["graphic tee", "vintage"]`
+- Stored in `session["parsed"]`
 
-**Step 2:**
-<!-- What happens next? What was returned from step 1? What tool is called now? -->
+**Step 2 — Search**
+- Call: `search_listings("vintage graphic tee", size=None, max_price=30.0)`
+- Returns ~3–5 matching listings sorted by keyword score
+- Top result example: `"Graphic Tee — 2003 Tour Bootleg Style"` — $24, Depop, size L
+- `session["search_results"]` = full list; `session["selected_item"]` = top result dict
 
-**Step 3:**
-<!-- Continue until the full interaction is complete -->
+**Step 3 — Suggest outfit**
+- Call: `suggest_outfit(session["selected_item"], example_wardrobe)`
+- LLM receives the band tee listing + 10 wardrobe items (baggy jeans, chunky sneakers, etc.)
+- Returns: *"Pair the bootleg tee with your baggy straight-leg jeans and white chunky sneakers. Roll the sleeves once for a relaxed 90s grunge vibe."*
+- `session["outfit_suggestion"]` = that string
+
+**Step 4 — Create fit card**
+- Call: `create_fit_card(session["outfit_suggestion"], session["selected_item"])`
+- Returns: *"scored this faded bootleg tee on depop for $24 and it's giving exactly the grunge energy i wanted 🖤 baggy jeans + chunky sneakers = easy win"*
+- `session["fit_card"]` = caption string
 
 **Final output to user:**
-<!-- What does the user actually see at the end? -->
+Three Gradio panels show:
+1. **Top listing** — title, price, platform, size, description
+2. **Outfit idea** — wardrobe-based styling suggestion
+3. **Fit card** — shareable caption
+
+**Error path (same session, different query):**
+Query: `"designer ballgown size XXS under $5"` → search returns `[]` → agent shows error in panel 1 only; panels 2 and 3 stay empty.

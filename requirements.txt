@@ -1,3 +1,18 @@
+# FitFindr — Python dependencies
+#
+# Install (with venv activated):
+#   pip install -r requirements.txt
+#
+# Also required (not installed via pip):
+#   - Python 3.10+
+#   - GROQ_API_KEY in .env (free key: https://console.groq.com)
+#
+# Package overview:
+#   groq           — LLM calls for suggest_outfit and create_fit_card
+#   python-dotenv  — loads GROQ_API_KEY from .env
+#   gradio         — web UI (python app.py)
+#   pytest         — tests (pytest tests/ -v)
+
 groq==0.15.0
 python-dotenv==1.0.1
 gradio>=6.9.0
